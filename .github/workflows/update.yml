@@ -1,0 +1,170 @@
+# Keeps Formula/varve.rb on the release of Hafeok/Varve that it should follow
+# (Varve ADR 0226 point 3), with nothing but this repository's own token.
+#
+# - Which release: the newest, prereleases included, until a 1.0.0 or later
+#   exists; then the newest stable one (script/pick-release.sh).
+# - Before a byte of the formula is written, the four macOS and Linux
+#   archives are checked against the release's SHA256SUMS, and each archive's
+#   build provenance is verified as Varve's publish.yml made it for that tag.
+# - Before the formula is committed, it is installed and tested on macOS
+#   arm64, macOS Intel and Linux.
+# - The commit goes through the contents API with GITHUB_TOKEN, and only when
+#   the formula changed. Varve's own workflows never push here: no token
+#   crosses repositories.
+
+name: Update the formula
+
+on:
+  schedule:
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "A tag of Hafeok/Varve, in place of the one the rule picks"
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-formula
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: Hafeok/Varve
+
+jobs:
+  formula:
+    name: the formula, from a verified release
+    runs-on: ubuntu-24.04
+
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      changed: ${{ steps.changed.outputs.changed }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Which release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${REQUESTED:-$(script/pick-release.sh "$UPSTREAM")}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Following \`$UPSTREAM\` \`$tag\`." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: The archives, checked and verified
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p "$RUNNER_TEMP/release"
+          cd "$RUNNER_TEMP/release"
+          gh release download "$TAG" --repo "$UPSTREAM" --pattern SHA256SUMS \
+            --pattern "varve-$version-osx-arm64.tar.gz" --pattern "varve-$version-osx-x64.tar.gz" \
+            --pattern "varve-$version-linux-arm64.tar.gz" --pattern "varve-$version-linux-x64.tar.gz"
+          for rid in osx-arm64 osx-x64 linux-arm64 linux-x64; do
+            archive="varve-$version-$rid.tar.gz"
+            if [ ! -f "$archive" ]; then echo "::error::$TAG carries no $archive"; exit 1; fi
+            grep -E "^[0-9a-f]{64}  \*?$archive\$" SHA256SUMS | sha256sum --check
+            gh attestation verify "$archive" --repo "$UPSTREAM" \
+              --source-ref "refs/tags/$TAG" \
+              --signer-workflow "$UPSTREAM/.github/workflows/publish.yml" \
+              --predicate-type https://slsa.dev/provenance/v1
+          done
+
+      - name: Write the formula
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          mkdir -p Formula
+          script/formula.sh "$TAG" "$RUNNER_TEMP/release/SHA256SUMS" "$UPSTREAM" > Formula/varve.rb
+
+      - name: Changed?
+        id: changed
+        run: |
+          if [ -n "$(git status --porcelain Formula/varve.rb)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            git diff Formula/varve.rb || true
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "The formula already follows \`${{ steps.release.outputs.tag }}\`." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload the formula
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: formula
+          path: Formula/varve.rb
+          if-no-files-found: error
+
+  smoke:
+    name: install (${{ matrix.os }})
+    needs: formula
+    if: needs.formula.outputs.changed == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel, ubuntu-24.04]
+
+    steps:
+      - name: Download the formula
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: formula
+          path: ${{ runner.temp }}/formula
+
+      - name: Install it, and test it
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          TAG: ${{ needs.formula.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_OS" = "Linux" ]; then eval "$(/home/linuxbrew/.linuxbrew/bin/brew shellenv)"; fi
+          brew tap-new --no-git hafeok/smoke
+          cp "$RUNNER_TEMP/formula/varve.rb" "$(brew --repository hafeok/smoke)/Formula/varve.rb"
+          brew install hafeok/smoke/varve
+          brew test hafeok/smoke/varve
+          said=$(varve --version)
+          echo "\`varve --version\` says \`$said\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${said%%+*}" != "${TAG#v}" ]; then echo "::error::varve says '$said', not ${TAG#v}"; exit 1; fi
+
+  commit:
+    name: commit the formula
+    needs: [formula, smoke]
+    if: needs.formula.outputs.changed == 'true'
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download the formula
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: formula
+          path: ${{ runner.temp }}/formula
+
+      - name: Commit it
+        # Through the contents API, so the commit is GitHub's, signed, with
+        # this repository's own token.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.formula.outputs.tag }}
+        run: |
+          set -euo pipefail
+          branch="${GITHUB_REF_NAME}"
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/Formula/varve.rb?ref=$branch" --jq .sha 2>/dev/null || true)
+          args=(-f message="varve ${TAG#v}, from $UPSTREAM $TAG" -f branch="$branch" -f content="$(base64 -w0 "$RUNNER_TEMP/formula/varve.rb")")
+          if [ -n "$sha" ]; then args+=(-f sha="$sha"); fi
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/contents/Formula/varve.rb" "${args[@]}" --jq '.commit.html_url' | tee -a "$GITHUB_STEP_SUMMARY"
